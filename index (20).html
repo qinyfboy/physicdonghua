@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>双球四独立弹簧（无中间墙）碰撞模拟（大字版）</title>
+    <style>
+        body { margin: 0; overflow: hidden; }
+        .controls { margin: 10px; font-size: 14px; } /* 控件容器字体增大 */
+        button { margin-right: 10px; font-size: 14px; } /* 按钮字体增大 */
+        input { width: 60px; margin: 0 10px; font-size: 14px; } /* 输入框字体增大 */
+        .speed-display { margin: 10px; font-size: 16px; } /* 速度显示字体增大 */
+        canvas { display: block; }
+        .momentum-display { margin: 10px; color: green; font-size: 16px; } /* 动量显示字体增大 */
+        #velocityCanvas { margin-top: 20px; }
+        .wall-marker { position: absolute; color: #666; font-size: 14px; } /* 墙壁标记字体增大（原12px→14px） */
+    </style>
+</head>
+<body>
+    <div class="controls">
+        <button id="startBtn" onclick="toggleAnimation()">开始</button>
+        <button onclick="reset()">重置</button>
+        <button onclick="nextFrame()">下一帧</button><br>
+        小球1速度: <input type="number" id="v1" value="-1">
+        小球2速度: <input type="number" id="v2" value="1"><br>
+        弹簧劲度系数: <input type="range" id="springK" min="10" max="500" value="120" step="10" oninput="updateSpringK()">
+        <span id="springKValue">120</span> N/m<br>
+        小球1质量: <input type="range" id="mass1" min="0.1" max="5" value="1" step="0.1" oninput="updateMass()">
+        <span id="mass1Value">1</span> kg<br>
+        小球2质量: <input type="range" id="mass2" min="0.1" max="5" value="1" step="0.1" oninput="updateMass()">
+        <span id="mass2Value">1</span> kg
+    </div>
+    <div class="speed-display">
+        小球1速度: <span id="speed1">0</span> | 
+        小球2速度: <span id="speed2">0</span>
+    </div>
+    <div class="momentum-display">
+        初始总动量: <span id="initialMomentum">0</span> kg·m/s | 
+        当前总动量: <span id="currentMomentum">0</span> kg·m/s | 
+        动量差: <span id="momentumDifference">0</span> kg·m/s
+    </div>
+    <div class="wall-marker" id="leftWallMarker">左墙 (0m)</div>
+    <div class="wall-marker" id="rightWallMarker">右墙 (10m)</div>
+    <canvas id="mainCanvas"></canvas>
+    <canvas id="velocityCanvas" width="800" height="200"></canvas>
+
+    <script>
+        const mainCanvas = document.getElementById('mainCanvas');
+        const vCanvas = document.getElementById('velocityCanvas');
+        const ctx = mainCanvas.getContext('2d');
+        const vCtx = velocityCanvas.getContext('2d');
+        const startBtn = document.getElementById('startBtn');
+        const speed1Display = document.getElementById('speed1');
+        const speed2Display = document.getElementById('speed2');
+        const initialMomentumDisplay = document.getElementById('initialMomentum');
+        const currentMomentumDisplay = document.getElementById('currentMomentum');
+        const momentumDifferenceDisplay = document.getElementById('momentumDifference');
+        const springKSlider = document.getElementById('springK');
+        const springKValue = document.getElementById('springKValue');
+        const mass1Slider = document.getElementById('mass1');
+        const mass1Value = document.getElementById('mass1Value');
+        const mass2Slider = document.getElementById('mass2');
+        const mass2Value = document.getElementById('mass2Value');
+
+        // 物理参数（无中间墙，四弹簧独立）
+        let m1 = 1;         // 小球1质量 (kg)
+        let m2 = 1;         // 小球2质量 (kg)
+        let k = 120;        // 弹簧系数 (N/m)
+        const r = 0.2;      // 小球半径 (m)
+        const L0 = 0.6;     // 所有弹簧原长 (m)
+        const dt = 0.01;    // 时间步长 (s)
+        const wallLeft = 0; // 左墙位置 (m)
+        const wallRight = 10; // 右墙位置 (m)
+        
+        // 初始状态（调整位置确保弹簧初始无压缩）
+        let x1 = 1.4, x2 = 8.6; // 红球中心1.4m（右边缘1.6m），篮球中心8.6m（左边缘8.4m）
+        let v1 = -1, v2 = 1;     // 初始速度
+        let initialMomentum = 0; // 初始总动量
+        let animating = false;
+        let animationId = null;
+        let history = [];
+        let canvasWidth = window.innerWidth;
+        let canvasHeight = 200; 
+        let scaleFactor = canvasWidth / 10; 
+        let isInitialStart = true;
+
+        // 速度图表参数
+        const chartMargin = 20;
+        const chartWidth = vCanvas.width - 2 * chartMargin;
+        const chartHeight = vCanvas.height - 2 * chartMargin;
+        const maxSpeed = 5; 
+
+        function calculateForces() {
+            // 计算四个独立弹簧的压缩量（无中间墙）
+            const spring1Compression = Math.max(0, L0 - (x1 - r - wallLeft));  // 红球左弹簧（左墙→红球左边缘）
+            const spring2Compression = Math.max(0, L0 - ((x2 - r) - (x1 + r)));  // 红球右弹簧（红球右边缘→篮球左边缘）
+            const spring3Compression = Math.max(0, L0 - ((x2 - r) - (x1 + r)));  // 篮球左弹簧（红球右边缘→篮球左边缘）→ 与spring2共享
+            const spring4Compression = Math.max(0, L0 - (wallRight - (x2 + r))); // 篮球右弹簧（篮球右边缘→右墙）
+
+            // 修正：中间两个弹簧为同一根，实际受力为：
+            const midSpringCompression = Math.max(0, L0 - ((x2 - r) - (x1 + r))); // 中间弹簧（红右→蓝左）
+
+            return {
+                F1: k * spring1Compression - k * midSpringCompression,  // 红球受力=左弹簧推力 - 中间弹簧拉力
+                F2: k * midSpringCompression - k * spring4Compression   // 篮球受力=中间弹簧推力 - 右弹簧拉力
+            };
+        }
+
+        function update() {
+            if (!animating && !isSingleFrame) return;
+            
+            const forces = calculateForces();
+            
+            v1 += forces.F1 / m1 * dt;
+            v2 += forces.F2 / m2 * dt;
+            
+            x1 += v1 * dt;
+            x2 += v2 * dt;
+            
+            // 碰撞检测（保持原逻辑）
+            if (x2 - x1 < 2 * r) {
+                const v1Before = v1;
+                const v2Before = v2;
+                
+                v1 = (v1Before * (m1 - m2) + 2 * m2 * v2Before) / (m1 + m2);
+                v2 = (v2Before * (m2 - m1) + 2 * m1 * v1Before) / (m1 + m2);
+                
+                x1 = (x1 + x2 - 2 * r) / 2;
+                x2 = x1 + 2 * r;
+            }
+
+            // 边界检测（保持原逻辑）
+            if (x1 - r < wallLeft) {
+                x1 = r;
+                v1 = -v1 * 0.8;
+            }
+            if (x2 + r > wallRight) {
+                x2 = wallRight - r;
+                v2 = -v2 * 0.8;
+            }
+
+            updateSpeedDisplay();
+            updateMomentumDisplay();
+
+            history.push({ t: Date.now(), v1, v2, m1, m2 });
+            if (history.length > 200) history.shift();
+            
+            draw();
+            
+            if (animating) {
+                animationId = requestAnimationFrame(update);
+            } else if (isSingleFrame) {
+                isSingleFrame = false;
+            }
+        }
+
+        let isSingleFrame = false;
+        
+        function nextFrame() {
+            if (animating) toggleAnimation();
+            isSingleFrame = true;
+            update();
+        }
+
+        function draw() {
+            ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+            vCtx.clearRect(0, 0, vCanvas.width, vCanvas.height);
+            
+            // 绘制墙壁（仅保留左右墙）
+            ctx.fillStyle = '#444';
+            ctx.fillRect(wallLeft*scaleFactor, 80, 10, 40);      // 左墙
+            ctx.fillRect(wallRight*scaleFactor - 10, 80, 10, 40); // 右墙
+            
+            const springColor = getSpringColor(k);
+            
+            // 绘制四个独立弹簧（无中间墙）
+            // 红球左弹簧（左墙→红球左边缘）
+            drawSpring(
+                wallLeft*scaleFactor + 10, 100,  // 左墙右侧边缘（x=10px）
+                x1*scaleFactor - r*scaleFactor, 100,  // 红球左边缘
+                springColor
+            );
+            // 中间弹簧（红球右边缘→篮球左边缘）
+            drawSpring(
+                x1*scaleFactor + r*scaleFactor, 100,  // 红球右边缘
+                x2*scaleFactor - r*scaleFactor, 100,  // 篮球左边缘
+                springColor
+            );
+            // 篮球右弹簧（篮球右边缘→右墙）
+            drawSpring(
+                x2*scaleFactor + r*scaleFactor, 100,  // 篮球右边缘
+                wallRight*scaleFactor - 10, 100,  // 右墙左侧边缘
+                springColor
+            );
+            
+            // 绘制小球
+            ctx.fillStyle = '#e74c3c';
+            ctx.beginPath();
+            ctx.arc(x1*scaleFactor, 100, r*scaleFactor, 0, Math.PI*2);
+            ctx.fill();
+            
+            ctx.fillStyle = '#3498db';
+            ctx.beginPath();
+            ctx.arc(x2*scaleFactor, 100, r*scaleFactor, 0, Math.PI*2);
+            ctx.fill();
+            
+            // 速度箭头
+            drawVelocityIndicator(x1*scaleFactor, 100, v1);
+            drawVelocityIndicator(x2*scaleFactor, 100, v2);
+            
+            // 质量信息（字体增大至14px）
+            drawMassInfo(x1*scaleFactor, 100 - r*scaleFactor - 15, m1); // 位置上移避免重叠
+            drawMassInfo(x2*scaleFactor, 100 - r*scaleFactor - 15, m2); // 原-10→-15
+            
+            drawVelocityChart();
+            updateWallMarkers(); // 更新墙壁位置标记
+        }
+
+        function drawSpring(x1, y1, x2, y2, color = '#2ecc71', coils = 5) {
+            const length = Math.abs(x2 - x1);
+            const restLength = L0 * scaleFactor; 
+            const isCompressed = length < restLength;
+            
+            if (!isCompressed) {
+                ctx.beginPath();
+                ctx.moveTo(x1, y1);
+                ctx.lineTo(x2, y2);
+                ctx.strokeStyle = '#ccc'; 
+                ctx.lineWidth = 1;
+                ctx.stroke();
+                return;
+            }
+            
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            
+            const compressionRatio = 1 - (restLength - length) / restLength;
+            
+            ctx.moveTo(x1, y1);
+            for (let i = 0; i <= 100; i++) {
+                const phase = i / 100 * Math.PI * 2 * coils;
+                const x = x1 + (x2 - x1) * i / 100;
+                const y = y1 + 15 * Math.sin(phase) * compressionRatio;
+                ctx.lineTo(x, y);
+            }
+            
+            ctx.stroke();
+        }
+
+        function drawVelocityIndicator(x, y, velocity) {
+            ctx.beginPath();
+            ctx.moveTo(x, y);
+            ctx.lineTo(x + velocity * 10, y);
+            ctx.strokeStyle = 'white';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+            
+            const arrowSize = 5;
+            if (velocity > 0) {
+                ctx.beginPath();
+                ctx.moveTo(x + velocity*10, y);
+                ctx.lineTo(x + velocity*10 - arrowSize, y - arrowSize);
+                ctx.lineTo(x + velocity*10 - arrowSize, y + arrowSize);
+            } else {
+                ctx.beginPath();
+                ctx.moveTo(x + velocity*10, y);
+                ctx.lineTo(x + velocity*10 + arrowSize, y - arrowSize);
+                ctx.lineTo(x + velocity*10 + arrowSize, y + arrowSize);
+            }
+            ctx.closePath();
+            ctx.fillStyle = 'white';
+            ctx.fill();
+        }
+
+        function drawMassInfo(x, y, mass) {
+            ctx.fillStyle = 'black';
+            ctx.font = '14px Arial'; // 原12px→14px
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(`${mass.toFixed(1)} kg`, x, y);
+        }
+
+        function drawVelocityChart() {
+            vCtx.strokeStyle = '#999';
+            vCtx.lineWidth = 1;
+            
+            vCtx.beginPath();
+            vCtx.moveTo(chartMargin, chartMargin + chartHeight);
+            vCtx.lineTo(chartMargin + chartWidth, chartMargin + chartHeight);
+            vCtx.stroke();
+            
+            vCtx.beginPath();
+            vCtx.moveTo(chartMargin, chartMargin);
+            vCtx.lineTo(chartMargin, chartMargin + chartHeight);
+            vCtx.stroke();
+            
+            vCtx.font = '12px Arial'; // 原10px→12px
+            vCtx.textAlign = 'center';
+            vCtx.textBaseline = 'top';
+            
+            const timeLabels = ['0', '2', '4', '6', '8', '10'];
+            const timePositions = [0, 40, 80, 120, 160, 200];
+            
+            timePositions.forEach((pos, index) => {
+                const x = chartMargin + pos * chartWidth / 200;
+                vCtx.beginPath();
+                vCtx.moveTo(x, chartMargin + chartHeight);
+                vCtx.lineTo(x, chartMargin + chartHeight + 5);
+                vCtx.stroke();
+                vCtx.fillText(timeLabels[index], x, chartMargin + chartHeight + 5);
+            });
+            
+            const speedLabels = ['-5', '-3', '-1', '1', '3', '5'];
+            const speedPositions = [-5, -3, -1, 1, 3, 5];
+            
+            speedPositions.forEach((speed, index) => {
+                const y = chartMargin + chartHeight - (speed + maxSpeed) * chartHeight / (2 * maxSpeed);
+                vCtx.beginPath();
+                vCtx.moveTo(chartMargin, y);
+                vCtx.lineTo(chartMargin - 5, y);
+                vCtx.stroke();
+                vCtx.textAlign = 'right';
+                vCtx.fillText(speedLabels[index], chartMargin - 7, y + 4);
+                vCtx.textAlign = 'center';
+            });
+            
+            vCtx.beginPath();
+            vCtx.moveTo(chartMargin, chartMargin + chartHeight / 2);
+            vCtx.lineTo(chartMargin + chartWidth, chartMargin + chartHeight / 2);
+            vCtx.setLineDash([5, 5]);
+            vCtx.stroke();
+            vCtx.setLineDash([]);
+            
+            vCtx.fillStyle = '#e74c3c';
+            vCtx.fillRect(chartMargin + chartWidth - 60, chartMargin, 10, 5);
+            vCtx.fillStyle = 'black';
+            vCtx.textAlign = 'left';
+            vCtx.fillText('小球1', chartMargin + chartWidth - 45, chartMargin + 5);
+            
+            vCtx.fillStyle = '#3498db';
+            vCtx.fillRect(chartMargin + chartWidth - 60, chartMargin + 15, 10, 5);
+            vCtx.fillStyle = 'black';
+            vCtx.textAlign = 'left';
+            vCtx.fillText('小球2', chartMargin + chartWidth - 45, chartMargin + 20);
+            
+            if (history.length < 2) return;
+            
+            vCtx.beginPath();
+            vCtx.strokeStyle = '#e74c3c';
+            history.forEach((p, i) => {
+                const x = chartMargin + i * chartWidth / 200;
+                const y = chartMargin + chartHeight - (p.v1 + maxSpeed) * chartHeight / (2 * maxSpeed);
+                i === 0 ? vCtx.moveTo(x, y) : vCtx.lineTo(x, y);
+            });
+            vCtx.stroke();
+            
+            vCtx.beginPath();
+            vCtx.strokeStyle = '#3498db';
+            history.forEach((p, i) => {
+                const x = chartMargin + i * chartWidth / 200;
+                const y = chartMargin + chartHeight - (p.v2 + maxSpeed) * chartHeight / (2 * maxSpeed);
+                i === 0 ? vCtx.moveTo(x, y) : vCtx.lineTo(x, y);
+            });
+            vCtx.stroke();
+        }
+
+        function toggleAnimation() {
+            if (animating) {
+                animating = false;
+                if (animationId) {
+                    cancelAnimationFrame(animationId);
+                    animationId = null;
+                }
+                startBtn.textContent = '继续';
+            } else {
+                if (isInitialStart) {
+                    v1 = parseFloat(document.getElementById('v1').value) || v1;
+                    v2 = parseFloat(document.getElementById('v2').value) || v2;
+                    isInitialStart = false;
+                }
+                animating = true;
+                update();
+                startBtn.textContent = '暂停';
+            }
+        }
+
+        function reset() {
+            if (animating) {
+                animating = false;
+                if (animationId) {
+                    cancelAnimationFrame(animationId);
+                    animationId = null;
+                }
+                startBtn.textContent = '开始';
+            }
+            
+            x1 = 1.4; // 红球初始中心位置（左边缘1.2m，到左墙0m的距离1.2m > L0=0.6m，初始无压缩）
+            x2 = 8.6; // 篮球初始中心位置（右边缘8.8m，到右墙10m的距离1.2m > L0=0.6m，初始无压缩）
+            v1 = -1;
+            v2 = 1;
+            m1 = 1;
+            m2 = 1;
+            k = 120;
+            isInitialStart = true;
+            
+            initialMomentum = m1 * v1 + m2 * v2;
+            initialMomentumDisplay.textContent = initialMomentum.toFixed(2);
+            
+            document.getElementById('v1').value = v1;
+            document.getElementById('v2').value = v2;
+            springKSlider.value = k;
+            springKValue.textContent = k;
+            mass1Slider.value = m1;
+            mass1Value.textContent = m1;
+            mass2Slider.value = m2;
+            mass2Value.textContent = m2;
+            
+            history = [];
+            updateSpeedDisplay();
+            updateMomentumDisplay();
+            draw();
+        }
+
+        function updateSpeedDisplay() {
+            speed1Display.textContent = v1.toFixed(2);
+            speed2Display.textContent = v2.toFixed(2);
+        }
+
+        function updateMomentumDisplay() {
+            const currentMomentum = m1 * v1 + m2 * v2;
+            const momentumDifference = currentMomentum - initialMomentum;
+            
+            currentMomentumDisplay.textContent = currentMomentum.toFixed(2);
+            momentumDifferenceDisplay.textContent = momentumDifference.toFixed(2);
+            
+            if (Math.abs(momentumDifference) < 0.001) {
+                momentumDifferenceDisplay.style.color = 'green';
+            } else {
+                momentumDifferenceDisplay.style.color = 'red';
+            }
+        }
+
+        function updateSpringK() {
+            k = parseInt(springKSlider.value);
+            springKValue.textContent = k;
+        }
+
+        function updateMass() {
+            m1 = parseFloat(mass1Slider.value);
+            m2 = parseFloat(mass2Slider.value);
+            mass1Value.textContent = m1.toFixed(1);
+            mass2Value.textContent = m2.toFixed(1);
+        }
+
+        function getSpringColor(stiffness) {
+            const minK = parseInt(springKSlider.min);
+            const maxK = parseInt(springKSlider.max);
+            const normalizedK = (stiffness - minK) / (maxK - minK);
+            
+            const r = Math.floor(46 + normalizedK * (231 - 46));
+            const g = Math.floor(204 - normalizedK * (204 - 76));
+            const b = Math.floor(119 - normalizedK * (119 - 60));
+            
+            return `rgb(${r}, ${g}, ${b})`;
+        }
+
+        function updateWallMarkers() {
+            // 更新左右墙标记的坐标
+            document.getElementById('leftWallMarker').style.left = `${wallLeft*scaleFactor + 15}px`;
+            document.getElementById('leftWallMarker').style.top = '90px';
+            
+            document.getElementById('rightWallMarker').style.left = `${wallRight*scaleFactor - 45}px`;
+            document.getElementById('rightWallMarker').style.top = '90px';
+        }
+
+        function resizeCanvas() {
+            canvasWidth = window.innerWidth;
+            mainCanvas.width = canvasWidth;
+            mainCanvas.height = canvasHeight;
+            scaleFactor = canvasWidth / 10;
+            updateWallMarkers(); // 窗口调整时更新标记位置
+            if (!animating) draw();
+        }
+
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+        reset();
+    </script>
+</body>
+</html>
+    
